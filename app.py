@@ -317,11 +317,14 @@ DEFAULT_REAL_CSV = "facility_load.csv"
 
 # Friendly display names for the measurements in the CSV
 MEAS_LABELS = {
+    "Hospital_Total": "Hospital Total Load",
+    # legacy / fallback names kept for compatibility
     "Generator":          "Diesel Generator",
     "Distribution_Main":  "Thermal / Heating",
     "HVAC_Main":          "HVAC / Ventilation",
 }
 MEAS_COLORS = {
+    "Hospital_Total":     C_BLUE,
     "Generator":          C_AMBER,
     "Distribution_Main":  "#E05C5C",
     "HVAC_Main":          C_BLUE,
@@ -340,8 +343,14 @@ def load_real_facility_data(csv_path: str) -> pd.DataFrame:
       - one column per measurement in kW
       - 'Total_kW' = sum of all measurements
     """
-    df = pd.read_csv(csv_path, parse_dates=["datetime"])
-    df["datetime"] = pd.to_datetime(df["datetime"], utc=True).dt.tz_convert(None)
+    df = pd.read_csv(csv_path)
+    # Handle both UTC-aware ("+00:00" suffix) and naive local timestamps
+    _dt = pd.to_datetime(df["datetime"], errors="coerce")
+    if _dt.dt.tz is not None:
+        _dt = _dt.dt.tz_convert(None)   # tz-aware → UTC-naive
+    else:
+        _dt = _dt.dt.tz_localize(None)  # already naive, just ensure no tz
+    df["datetime"] = _dt
 
     # Pivot: one row per timestamp, one column per measurement
     piv = df.pivot_table(
