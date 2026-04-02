@@ -17,6 +17,7 @@ Modules:
 import warnings
 warnings.filterwarnings("ignore")
 
+import io
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -258,7 +259,7 @@ def forecast_prices_24h(price_history_json: str, ref_dt_str: str) -> pd.Series:
     """
     from scipy.ndimage import gaussian_filter1d  # for smoothing
 
-    history = pd.read_json(price_history_json, typ="series")
+    history = pd.read_json(io.StringIO(price_history_json), typ="series")
     history.index = pd.to_datetime(history.index)
     history = history.sort_index()
     ref_dt  = pd.to_datetime(ref_dt_str)
@@ -446,8 +447,8 @@ def run_period_simulation(
       Date | Baseline_Cost_EUR | Optimised_Cost_EUR | Savings_EUR |
       Total_Load_kWh | Total_Solar_kWh | LP_Status
     """
-    hourly_load   = pd.read_json(load_json,  typ="series")
-    hourly_prices = pd.read_json(price_json, typ="series")
+    hourly_load   = pd.read_json(io.StringIO(load_json),  typ="series")
+    hourly_prices = pd.read_json(io.StringIO(price_json), typ="series")
 
     # Ensure DatetimeIndex
     hourly_load.index   = pd.to_datetime(hourly_load.index)
