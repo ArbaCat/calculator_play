@@ -485,9 +485,10 @@ def run_period_simulation(
 
         results.append({
             "Date":               day.date(),
-            "Baseline_Cost_EUR":  res["cost_base"],   # solar-only baseline (no BESS)
-            "Optimised_Cost_EUR": res["cost_optimised"],
-            "Savings_EUR":        res["savings"],
+            "GridOnly_Cost_EUR":  res["cost_grid_only"],  # no solar, no BESS
+            "Baseline_Cost_EUR":  res["cost_base"],       # solar only, no BESS
+            "Optimised_Cost_EUR": res["cost_optimised"],  # solar + BESS
+            "Savings_EUR":        res["savings"],          # vs grid-only
             "Total_Load_kWh":     float(day_load.sum()),
             "Total_Solar_kWh":    float(solar.sum()),
             "LP_Status":          res["status"],
@@ -668,13 +669,22 @@ def solar_generation_forecast(
     bell   = np.exp(-0.5 * ((hours - noon) / width) ** 2)
     bell   = np.where((hours >= sunrise) & (hours <= sunset), bell, 0.0)
 
-    # Apply peak & efficiency
-    gen = peak_kw * efficiency / 0.18 * bell   # normalise efficiency to 18 % base
+    # Apply peak & efficiency, then scale to match real monthly yield for Slovakia.
+    # Raw bell integral overestimates by ~2× because it ignores clouds, panel tilt,
+    # inverter losses, and low sun angle.  We use PVGIS-derived monthly kWh/kWp
+    # values for central Slovakia (south-facing 30° tilt) as ground truth.
+    _SK_YIELD = {1:1.0, 2:1.8, 3:3.0, 4:3.8, 5:4.2, 6:4.5,
+                 7:4.5, 8:4.0, 9:3.2, 10:2.0, 11:1.0, 12:0.7}
+    raw_integral = bell.sum()  # kWh/kWp from raw gaussian
+    target_yield = _SK_YIELD.get(month, 3.0)
+    scale = target_yield / raw_integral if raw_integral > 0.01 else 0.0
+
+    gen = peak_kw * efficiency / 0.18 * bell * scale
     gen = np.clip(gen, 0, peak_kw)
 
-    # Mild cloud-cover noise
+    # Mild day-to-day cloud noise centered at 1.0 (±15%, no bias)
     rng = np.random.default_rng(day_noise_seed)
-    cloud = 1.0 - rng.beta(8, 2, 24) * 0.3
+    cloud = 1.0 + (rng.beta(5, 5, 24) - 0.5) * 0.3
     gen   = gen * cloud
 
     return pd.Series(gen, index=range(24), name="SolarForecast_kW")
@@ -768,6 +778,7 @@ def optimize_bess_dispatch(
     prob.solve(solver)
 
     status = pulp.LpStatus[prob.status]
+    cost_grid_only = float(np.sum(load_kw.values * prices_kwh))  # no solar, no BESS
     if status not in ("Optimal", "Feasible"):
         # Return unoptimised baseline
         base_cost = float(np.sum(
@@ -778,6 +789,7 @@ def optimize_bess_dispatch(
             "schedule": None,
             "cost_optimised": base_cost,
             "cost_base": base_cost,
+            "cost_grid_only": cost_grid_only,
             "savings": 0.0,
         }
 
@@ -796,17 +808,19 @@ def optimize_bess_dispatch(
 
     cost_optimised = float(pulp.value(prob.objective))
 
-    # Baseline cost (no battery, just grid covers net load)
+    # Baseline cost: solar only, no BESS
     base_net = np.maximum(load_kw.values - solar_kw.values, 0)
     cost_base = float(np.sum(base_net * prices_kwh))
 
-    savings = cost_base - cost_optimised
+    # Total savings vs grid-only (no solar, no BESS)
+    savings = cost_grid_only - cost_optimised
 
     return {
         "status": status,
         "schedule": schedule,
         "cost_optimised": cost_optimised,
         "cost_base": cost_base,
+        "cost_grid_only": cost_grid_only,
         "savings": savings,
     }
 
@@ -1763,39 +1777,52 @@ def main():
                 st.error("Simulation returned no results. Check data and parameters.")
             else:
                 sim_df["Date"] = pd.to_datetime(sim_df["Date"])
-                sim_df["Cumulative_Actual_EUR"]    = sim_df["Baseline_Cost_EUR"].cumsum()
-                sim_df["Cumulative_Optimised_EUR"] = sim_df["Optimised_Cost_EUR"].cumsum()
-                sim_df["Cumulative_Savings_EUR"]   = sim_df["Savings_EUR"].cumsum()
-                sim_df["Savings_pct"]              = (
-                    sim_df["Savings_EUR"] / sim_df["Baseline_Cost_EUR"] * 100
+                sim_df["Cumulative_GridOnly_EUR"]   = sim_df["GridOnly_Cost_EUR"].cumsum()
+                sim_df["Cumulative_Baseline_EUR"]   = sim_df["Baseline_Cost_EUR"].cumsum()
+                sim_df["Cumulative_Optimised_EUR"]  = sim_df["Optimised_Cost_EUR"].cumsum()
+                sim_df["Cumulative_Savings_EUR"]    = sim_df["Savings_EUR"].cumsum()
+                sim_df["Savings_pct"]               = (
+                    sim_df["Savings_EUR"] / sim_df["GridOnly_Cost_EUR"] * 100
                 ).clip(0, 100)
 
-                total_actual    = sim_df["Baseline_Cost_EUR"].sum()
+                total_grid_only = sim_df["GridOnly_Cost_EUR"].sum()
+                total_baseline  = sim_df["Baseline_Cost_EUR"].sum()
                 total_optimised = sim_df["Optimised_Cost_EUR"].sum()
-                total_savings   = sim_df["Savings_EUR"].sum()
+                total_savings   = sim_df["Savings_EUR"].sum()   # vs grid-only
                 total_load_kwh  = sim_df["Total_Load_kWh"].sum()
                 total_solar_kwh = sim_df["Total_Solar_kWh"].sum()
-                avg_savings_pct = (total_savings / total_actual * 100) if total_actual > 0 else 0
+                avg_savings_pct = (total_savings / total_grid_only * 100) if total_grid_only > 0 else 0
+                solar_only_savings = total_grid_only - total_baseline
+                bess_only_savings  = total_baseline - total_optimised
                 n_days_sim      = len(sim_df)
                 annual_savings  = total_savings / n_days_sim * 365
 
                 # ── Top KPIs ──────────────────────────────────────────────
-                k1, k2, k3, k4, k5 = st.columns(5)
+                k1, k2, k3, k4, k5, k6 = st.columns(6)
                 with k1:
-                    st.markdown(kpi_card("Baseline Cost", f"€{total_actual:.2f}",
-                        f"Solar only, no BESS"), unsafe_allow_html=True)
+                    st.markdown(kpi_card("Grid Only Cost",
+                        f"€{total_grid_only:,.2f}",
+                        "No Solar, no BESS"), unsafe_allow_html=True)
                 with k2:
-                    st.markdown(kpi_card("Optimised Cost", f"€{total_optimised:.2f}",
-                        "With BESS + Solar"), unsafe_allow_html=True)
+                    st.markdown(kpi_card("Solar Only Cost",
+                        f"€{total_baseline:,.2f}",
+                        f"Saves €{solar_only_savings:,.0f} from solar"),
+                        unsafe_allow_html=True)
                 with k3:
-                    st.markdown(kpi_card("Total Savings", f"€{total_savings:.2f}",
-                        f"{avg_savings_pct:.1f}% reduction", green=True),
+                    st.markdown(kpi_card("Optimised Cost",
+                        f"€{total_optimised:,.2f}",
+                        f"+€{bess_only_savings:,.0f} from BESS"),
                         unsafe_allow_html=True)
                 with k4:
+                    st.markdown(kpi_card("Total Savings",
+                        f"€{total_savings:,.2f}",
+                        f"{avg_savings_pct:.1f}% vs grid-only", green=True),
+                        unsafe_allow_html=True)
+                with k5:
                     st.markdown(kpi_card("Est. Annual Savings",
                         f"€{annual_savings:,.0f}",
                         "Extrapolated from period"), unsafe_allow_html=True)
-                with k5:
+                with k6:
                     total_capex = cap_kwh * batt_cost_kwh_input + pv_peak * solar_cost_kwp
                     payback = total_capex / annual_savings if annual_savings > 0 else 0
                     st.markdown(kpi_card("Est. Payback",
@@ -1807,14 +1834,18 @@ def main():
                 # ── Daily cost comparison bars ────────────────────────────
                 fig_cmp = go.Figure()
                 fig_cmp.add_trace(go.Bar(
+                    x=sim_df["Date"], y=sim_df["GridOnly_Cost_EUR"],
+                    name="Grid Only (€)", marker_color="#AA3333", opacity=0.7,
+                ))
+                fig_cmp.add_trace(go.Bar(
                     x=sim_df["Date"], y=sim_df["Baseline_Cost_EUR"],
-                    name="Baseline Cost — Solar, no BESS (€)", marker_color="#CC3333", opacity=0.8,
+                    name="Solar Only (€)", marker_color=C_AMBER, opacity=0.8,
                 ))
                 fig_cmp.add_trace(go.Bar(
                     x=sim_df["Date"], y=sim_df["Optimised_Cost_EUR"],
-                    name="Optimised Cost (€)", marker_color=C_GREEN, opacity=0.85,
+                    name="Solar + BESS (€)", marker_color=C_GREEN, opacity=0.85,
                 ))
-                lay_cmp = plotly_base_layout("Daily Cost: Actual vs. BESS+Solar Optimised")
+                lay_cmp = plotly_base_layout("Daily Cost: Grid Only vs. Solar Only vs. Solar+BESS")
                 lay_cmp["barmode"]         = "group"
                 lay_cmp["xaxis"]["title"]  = "Date"
                 lay_cmp["yaxis"]["title"]  = "Cost (€)"
@@ -1827,21 +1858,26 @@ def main():
                 with col_cum:
                     fig_cum = go.Figure()
                     fig_cum.add_trace(go.Scatter(
-                        x=sim_df["Date"], y=sim_df["Cumulative_Actual_EUR"],
-                        name="Cumulative Actual", fill="tozeroy",
-                        fillcolor="rgba(204,51,51,0.15)",
-                        line=dict(color="#CC3333", width=2),
+                        x=sim_df["Date"], y=sim_df["Cumulative_GridOnly_EUR"],
+                        name="Grid Only", fill="tozeroy",
+                        fillcolor="rgba(170,51,51,0.10)",
+                        line=dict(color="#AA3333", width=1.5, dash="dot"),
+                    ))
+                    fig_cum.add_trace(go.Scatter(
+                        x=sim_df["Date"], y=sim_df["Cumulative_Baseline_EUR"],
+                        name="Solar Only",
+                        line=dict(color=C_AMBER, width=2),
                     ))
                     fig_cum.add_trace(go.Scatter(
                         x=sim_df["Date"], y=sim_df["Cumulative_Optimised_EUR"],
-                        name="Cumulative Optimised", fill="tozeroy",
-                        fillcolor="rgba(38,178,75,0.20)",
+                        name="Solar + BESS", fill="tozeroy",
+                        fillcolor="rgba(38,178,75,0.15)",
                         line=dict(color=C_GREEN, width=2.5),
                     ))
                     fig_cum.add_trace(go.Scatter(
                         x=sim_df["Date"], y=sim_df["Cumulative_Savings_EUR"],
-                        name="Cumulative Savings",
-                        line=dict(color=C_AMBER, width=2, dash="dash"),
+                        name="Cumulative Savings (vs Grid Only)",
+                        line=dict(color="#FFFFFF", width=2, dash="dash"),
                     ))
                     lay_cum = plotly_base_layout("Cumulative Costs & Savings (€)")
                     lay_cum["xaxis"]["title"] = "Date"
@@ -1859,7 +1895,7 @@ def main():
                             colorscale=[[0, C_GREY2], [0.5, C_GREEN], [1, C_AMBER]],
                         ),
                     ))
-                    lay_pct = plotly_base_layout("Daily Savings (% of actual cost)")
+                    lay_pct = plotly_base_layout("Daily Savings (% of grid-only cost)")
                     lay_pct["xaxis"]["title"] = "Date"
                     lay_pct["yaxis"]["title"] = "Savings %"
                     fig_pct.update_layout(**lay_pct)
@@ -1890,19 +1926,22 @@ def main():
                 with st.expander("View Daily Simulation Table"):
                     disp = sim_df.copy()
                     disp["Date"] = disp["Date"].dt.date
-                    for col_num in ["Baseline_Cost_EUR", "Optimised_Cost_EUR",
+                    for col_num in ["GridOnly_Cost_EUR", "Baseline_Cost_EUR",
+                                    "Optimised_Cost_EUR",
                                     "Savings_EUR", "Cumulative_Savings_EUR"]:
                         disp[col_num] = disp[col_num].round(3)
                     disp["Savings_pct"] = disp["Savings_pct"].round(1)
                     st.dataframe(
                         disp[["Date", "Total_Load_kWh", "Total_Solar_kWh",
-                              "Baseline_Cost_EUR", "Optimised_Cost_EUR",
+                              "GridOnly_Cost_EUR", "Baseline_Cost_EUR",
+                              "Optimised_Cost_EUR",
                               "Savings_EUR", "Savings_pct",
                               "Cumulative_Savings_EUR", "LP_Status"]]
                         .style.format({
                             "Total_Load_kWh":      "{:.1f}",
                             "Total_Solar_kWh":     "{:.1f}",
-                            "Baseline_Cost_EUR":     "€{:.3f}",
+                            "GridOnly_Cost_EUR":   "€{:.3f}",
+                            "Baseline_Cost_EUR":   "€{:.3f}",
                             "Optimised_Cost_EUR":  "€{:.3f}",
                             "Savings_EUR":         "€{:.3f}",
                             "Savings_pct":         "{:.1f}%",
